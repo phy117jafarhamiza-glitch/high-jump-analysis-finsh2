@@ -813,3 +813,235 @@ def measure_vertical_jump(data, height_cm):
             notes.append("زمن الطيران أطول من المعقول؛ هل الفيديو بالحركة البطيئة؟")
         return {"height_cm": round(float(h_cm), 1), "flight_s": round(float(flight), 3),
                 "takeoff_idx": int(a), "landing_idx": int(b), "notes": notes}
+
+
+# ============================================================================
+# 10) الكاميرا الأمامية/الخلفية: متغيرات المستوى الأمامي
+# ============================================================================
+def frontal_metrics(res):
+    """
+    من فيديو أمامي أو خلفي (بعد pa.analyze لتحديد اللحظات):
+      - الميل الداخلي للجسم (من قدم الارتقاء إلى منتصف الكتفين) لحظة وضع القدم ولحظة الارتقاء
+      - ميل الجذع الجانبي لحظة الارتقاء (موجب = بعيداً عن العارضة، سالب = نحو العارضة)
+      - انحراف ركبة الارتقاء للداخل أثناء الارتكاز
+      - ميل محوري الكتفين والورك لحظة الارتقاء
+    الإشارة موحّدة: اتجاه الميل الداخلي لحظة وضع القدم = موجب، فلا يهم إن كان التصوير من الأمام أو الخلف.
+    """
+    p = res["points"]
+    ev = res["events"]
+    plant, takeoff = ev["plant"], ev["takeoff"]
+    left = res["take_leg"] == "اليسرى"
+    hip_i, knee_i, ank_i = (L_HIP, L_KNEE, L_ANK) if left else (R_HIP, R_KNEE, R_ANK)
+    oth_hip = R_HIP if left else L_HIP
+    sh = _mid(p, L_SH, R_SH)
+    hip = _mid(p, L_HIP, R_HIP)
+
+    def lean(k):  # زاوية الخط من كاحل الارتقاء إلى منتصف الكتفين عن العمودي (بإشارة الصورة)
+        v = sh[k] - p[k, ank_i, :2]
+        return math.degrees(math.atan2(v[0], -v[1]))
+
+    raw_plant = lean(plant)
+    sign = 1.0 if raw_plant >= 0 else -1.0   # نجعل الميل الداخلي عند الوضع موجباً
+    m = {"f_lean_plant_deg": abs(raw_plant), "f_lean_takeoff_deg": sign * lean(takeoff)}
+    v = sh[takeoff] - hip[takeoff]
+    m["f_trunk_tilt_takeoff_deg"] = sign * math.degrees(math.atan2(v[0], -v[1]))
+
+    # انحراف الركبة: أقصى بعد للركبة عن الخط الواصل بين الورك والكاحل أثناء الارتكاز، نحو خط الوسط = موجب
+    best = None
+    for k in range(plant, takeoff + 1):
+        a, kn, c = p[k, hip_i, :2], p[k, knee_i, :2], p[k, ank_i, :2]
+        if np.any(np.isnan([*a, *kn, *c])):
+            continue
+        ang = 180.0 - float(angle3(a, kn, c))
+        line = c - a
+        cross = line[0] * (kn - a)[1] - line[1] * (kn - a)[0]
+        mid_dir = p[k, oth_hip, :2] - a
+        cross_mid = line[0] * mid_dir[1] - line[1] * mid_dir[0]
+        s = 1.0 if cross * cross_mid > 0 else -1.0
+        if best is None or ang > abs(best):
+            best = s * ang
+    m["f_knee_valgus_deg"] = best
+    for key, (a, b) in (("f_shoulder_tilt_deg", (L_SH, R_SH)), ("f_hip_tilt_deg", (L_HIP, R_HIP))):
+        d = p[takeoff, b, :2] - p[takeoff, a, :2]
+        ang = math.degrees(math.atan2(-d[1], d[0]))
+        ang = (ang + 90) % 180 - 90   # بين -90 و90
+        m[key] = abs(ang)
+    return {k: _r(v) for k, v in m.items()}
+
+
+# ============================================================================
+# 11) الكاميرا العلوية (درون/سقف): تتبع مسار اللاعب
+# ============================================================================
+def top_background(video_path, n=40, max_side=960):
+    """صورة الخلفية (وسيط الإطارات) لتحديد طرفي العارضة عليها."""
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    idxs = set(np.linspace(0, max(0, total - 1), n).astype(int)) if total else set(range(n))
+    frames, k = [], 0
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        if k in idxs:
+            frames.append(f)
+        k += 1
+    cap.release()
+    if not frames:
+        raise RuntimeError("تعذّرت قراءة فيديو الكاميرا العلوية.")
+    bg = np.median(np.stack(frames), axis=0).astype(np.uint8)
+    return cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
+
+
+def track_top(video_path, slowmo_factor=1.0, progress=None, max_frames=900):
+    """تتبع مركز اللاعب من الأعلى بطرح الخلفية (الكاميرا يجب أن تكون ثابتة)."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    step = max(1, math.ceil(total / max_frames)) if total else 1
+    sub = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=32, detectShadows=True)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    min_area = w * h * 0.0004
+    pts, ts, prev, i = [], [], None, 0
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        if i % step:
+            i += 1
+            continue
+        mask = sub.apply(f)
+        mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)[1]      # إزالة الظلال
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cands = []
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < min_area:
+                continue
+            M = cv2.moments(c)
+            cands.append((a, np.array([M["m10"] / M["m00"], M["m01"] / M["m00"]])))
+        c = None
+        if cands and i > 5 * step:   # الإطارات الأولى تبني نموذج الخلفية
+            if prev is None:
+                c = max(cands, key=lambda z: z[0])[1]
+            else:
+                near = min(cands, key=lambda z: np.linalg.norm(z[1] - prev))
+                if np.linalg.norm(near[1] - prev) < 0.15 * max(w, h):
+                    c = near[1]
+        pts.append(c if c is not None else np.array([np.nan, np.nan]))
+        if c is not None:
+            prev = c
+        ts.append(i / fps / slowmo_factor)
+        if progress and total:
+            progress(min(1.0, i / total))
+        i += 1
+    cap.release()
+    xy = np.array(pts, float)
+    fr = fps / step * slowmo_factor
+    for c in range(2):
+        xy[:, c] = _smooth(_interp_nans(xy[:, c], max(2, int(fr * 0.3))), max(3, int(round(fr * 0.1)) | 1))
+    if np.isnan(xy[:, 0]).mean() > 0.8:
+        raise RuntimeError("لم يُكتشف اللاعب في فيديو الكاميرا العلوية. تأكد أن الكاميرا ثابتة وأن اللاعب يظهر بوضوح.")
+    return {"t": np.array(ts), "xy": xy, "fps": fr, "size": (w, h)}
+
+
+def _fit_circle(xy):
+    x, y = xy[:, 0], xy[:, 1]
+    A = np.c_[2 * x, 2 * y, np.ones(len(x))]
+    b = x ** 2 + y ** 2
+    (cx, cy, c), *_ = np.linalg.lstsq(A, b, rcond=None)
+    r = math.sqrt(max(c + cx ** 2 + cy ** 2, 0))
+    return cx, cy, r
+
+
+def top_metrics(track, bar, bar_len_m=4.0, dt_takeoff_to_bar=None):
+    """
+    bar: (x1, y1, x2, y2) طرفا العارضة بالبكسل (الطرف 1 = القائم القريب من بداية الاقتراب).
+    dt_takeoff_to_bar: الزمن من الارتقاء إلى عبور العارضة (من الكاميرا الجانبية إن وُجدت).
+    """
+    t, xy = track["t"], track["xy"]
+    b1, b2 = np.array(bar[:2], float), np.array(bar[2:], float)
+    L = np.linalg.norm(b2 - b1)
+    if L < 5:
+        raise RuntimeError("حدّد طرفي العارضة على صورة الكاميرا العلوية.")
+    m_per_px = bar_len_m / L
+    u = (b2 - b1) / L
+    nrm = np.array([-u[1], u[0]])
+    dist = (xy - b1) @ nrm                     # بعد إشاري عن خط العارضة
+    good = ~np.isnan(dist)
+    idx = np.where(good)[0]
+    if len(idx) < 10:
+        raise RuntimeError("المسار المتتبَّع قصير جداً.")
+    start_side = np.sign(np.nanmedian(dist[idx[: max(3, len(idx) // 5)]]))
+    cross = None
+    for k in idx[1:]:
+        if np.sign(dist[k]) == -start_side and np.sign(dist[k - 1]) == start_side:
+            cross = k
+            break
+    notes = []
+    if cross is None:
+        cross = int(idx[np.nanargmin(np.abs(dist[idx]))])
+        notes.append("لم يُكتشف عبور واضح للعارضة؛ استُخدمت أقرب نقطة إليها.")
+    if dt_takeoff_to_bar is None:
+        dt_takeoff_to_bar = 0.3
+        notes.append("لا توجد كاميرا جانبية للمزامنة؛ قُدّرت لحظة الارتقاء بـ 0.3 ث قبل عبور العارضة.")
+    # لحظة العبور بدقة أقل من إطار (استيفاء خطي للبعد عن العارضة)
+    t_cross = t[cross]
+    if cross > 0 and not np.isnan(dist[cross - 1]) and dist[cross] != dist[cross - 1]:
+        f = dist[cross - 1] / (dist[cross - 1] - dist[cross])
+        t_cross = t[cross - 1] + float(np.clip(f, 0, 1)) * (t[cross] - t[cross - 1])
+    tk = int(np.clip(np.argmin(np.abs(t - (t_cross - dt_takeoff_to_bar))), 1, len(t) - 2))
+    p_to = xy[tk]
+    m = {"t_takeoff_dist_m": abs(dist[tk]) * m_per_px,
+         "t_takeoff_along_bar_m": float((p_to - b1) @ u) * m_per_px}
+    k0 = int(np.searchsorted(t, t[tk] - 0.12))
+    vel = xy[tk] - xy[k0]
+    if np.linalg.norm(vel) > 0:
+        ang = math.degrees(math.acos(abs(float(vel @ u)) / np.linalg.norm(vel)))
+        m["t_approach_angle_deg"] = 90 - ang   # الزاوية بين اتجاه الحركة وخط العارضة
+    s0 = int(np.searchsorted(t, t[tk] - 0.5))
+    seg = xy[s0:tk + 1]
+    seg = seg[~np.isnan(seg[:, 0])]
+    if len(seg) > 3:
+        m["t_speed_mps"] = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) * m_per_px / (t[tk] - t[s0])
+    c0 = int(np.searchsorted(t, t[tk] - 0.8))   # آخر 3–4 خطوات
+    arc = xy[c0:tk + 1]
+    arc = arc[~np.isnan(arc[:, 0])]
+    circle = None
+    if len(arc) >= 6:
+        cx, cy, r = _fit_circle(arc)
+        if r * m_per_px < 60:
+            m["t_curve_radius_m"] = r * m_per_px
+            circle = (cx, cy, r)
+        else:
+            notes.append("المسار الأخير شبه مستقيم؛ نصف قطر المنحنى كبير جداً ولم يُحسب.")
+    return {"metrics": {k: _r(v, 2) for k, v in m.items()}, "takeoff_idx": tk, "cross_idx": int(cross),
+            "circle": circle, "notes": notes}
+
+
+def draw_top(bg_rgb, track, bar, tm):
+    img = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR).copy()
+    th = max(2, img.shape[1] // 400)
+    pts = track["xy"][~np.isnan(track["xy"][:, 0])].astype(int)
+    if len(pts) > 1:
+        cv2.polylines(img, [pts.reshape(-1, 1, 2)], False, (255, 180, 0), th, cv2.LINE_AA)
+    cv2.line(img, tuple(int(v) for v in bar[:2]), tuple(int(v) for v in bar[2:]), (0, 0, 255), th + 1, cv2.LINE_AA)
+    if tm.get("circle"):
+        cx, cy, r = tm["circle"]
+        cv2.circle(img, (int(cx), int(cy)), int(r), (0, 200, 0), 1, cv2.LINE_AA)
+    k = tm["takeoff_idx"]
+    if not np.isnan(track["xy"][k, 0]):
+        cv2.circle(img, tuple(int(v) for v in track["xy"][k]), th * 4, (0, 255, 255), -1, cv2.LINE_AA)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def bar_preview(bg_rgb, bar):
+    img = bg_rgb.copy()
+    th = max(2, img.shape[1] // 300)
+    a, b = tuple(int(v) for v in bar[:2]), tuple(int(v) for v in bar[2:])
+    cv2.line(img, a, b, (255, 0, 0), th, cv2.LINE_AA)
+    cv2.circle(img, a, th * 3, (0, 200, 0), -1)
+    cv2.circle(img, b, th * 3, (255, 200, 0), -1)
+    return img

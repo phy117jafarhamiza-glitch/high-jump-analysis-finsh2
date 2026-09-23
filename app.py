@@ -1,0 +1,1020 @@
+"""
+المحلل الذكي للوثب العالي (AI Coach) — نظام متكامل لأطروحة:
+تأثير تمرينات تصحيحية وفق أنموذج تعليمي مُعد باستخدام الشبكات العصبية الالتفافية (CNN)
+في بعض القابليات البدنية والمتغيرات البايوميكانيكية والإنجاز للاعبي القفز العالي.
+
+الصفحات: اللاعبون • التحليل الحركي • الاختبارات والإنجاز • المقارنة القبلية/البعدية
+          • البرنامج التدريبي • الإحصاء والتصدير • الأنموذج التعليمي • الإعدادات
+"""
+import base64
+import hashlib
+import json
+import os
+import tempfile
+from datetime import date
+
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import model
+import pose_analysis as pa
+import storage
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+BANK_PATH = os.path.join(APP_DIR, "model_bank.xlsx")
+
+st.set_page_config(page_title="المحلل الذكي للوثب العالي", page_icon="🧠", layout="wide")
+
+if not hasattr(pa, "measure_vertical_jump") or not hasattr(model, "build_program"):
+    st.error("⚠️ بعض ملفات التطبيق قديمة. ارفع كل الملفات الجديدة إلى GitHub ثم اضغط Manage app ← ⋮ ← Reboot app.")
+    st.stop()
+
+st.markdown(
+    """
+    <style>
+    [data-testid="stMarkdownContainer"], [data-testid="stCaptionContainer"],
+    [data-testid="stSidebar"] {direction: rtl; text-align: right;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+PHASES = ["قبلي", "بعدي"]
+MEASURES = ["قبلي", "متابعة", "بعدي"]
+GROUPS = ["تجريبية", "ضابطة"]
+EVENT_NAMES = {
+    "approach": "نهاية الاقتراب", "plant": "وضع قدم الارتقاء", "takeoff": "ترك الأرض",
+    "peak": "أعلى نقطة", "clearance": "اجتياز العارضة",
+}
+CLAUDE_MODELS = {
+    "Claude Sonnet 5 (موصى به)": "claude-sonnet-5",
+    "Claude Opus 5.5 (أدق وأغلى)": "claude-opus-5-5",
+    "Claude Haiku 4.5 (أسرع وأرخص)": "claude-haiku-4-5-20251001",
+}
+SLOWMO_OPTS = [1, 2, 4, 8]
+
+
+def slowmo_label(x):
+    return "لا (سرعة عادية)" if x == 1 else f"نعم، أبطأ {x} مرات"
+
+
+# ============================================================================
+# الموارد المشتركة
+# ============================================================================
+def secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+@st.cache_resource(show_spinner="تحميل نموذج تقدير وضع الجسم (مرة واحدة فقط)...")
+def get_model_path():
+    return pa.download_model()
+
+
+@st.cache_resource
+def default_bank():
+    return model.load_bank(BANK_PATH)
+
+
+def get_bank():
+    if st.session_state.get("bank_bytes"):
+        return model.load_bank(st.session_state["bank_bytes"])
+    if not os.path.exists(BANK_PATH):
+        st.error("⚠️ ملف الأنموذج التعليمي **model_bank.xlsx** غير موجود في المستودع. "
+                 "ارفعه إلى GitHub في نفس مكان app.py (بالاسم نفسه تماماً)، ثم اضغط Reboot app. "
+                 "أو ارفعه هنا مؤقتاً لهذه الجلسة:")
+        up = st.file_uploader("model_bank.xlsx", type=["xlsx"], key="bank_missing")
+        if up is not None:
+            try:
+                model.load_bank(up.getvalue())
+                st.session_state["bank_bytes"] = up.getvalue()
+                st.rerun()
+            except Exception as e:
+                st.error(f"الملف غير صالح: {e}")
+        st.stop()
+    return default_bank()
+
+
+def get_store():
+    if "store" not in st.session_state:
+        st.session_state["local_db"] = st.session_state.get("local_db", {})
+        st.session_state["store"] = storage.Store(
+            url=secret("SHEETS_URL"), token=secret("SHEETS_TOKEN"), local_db=st.session_state["local_db"])
+    return st.session_state["store"]
+
+
+def safe_read(store, sheet):
+    try:
+        return store.read(sheet)
+    except storage.StoreError as e:
+        st.error(f"تعذّرت قراءة البيانات من Google Sheets: {e}")
+        return pd.DataFrame()
+
+
+def players_df(store):
+    df = safe_read(store, "players")
+    if df.empty or "code" not in df:
+        return pd.DataFrame(columns=["code", "name", "group", "gender", "height", "weight"])
+    df["code"] = df["code"].astype(str)
+    return df.drop_duplicates("code", keep="last")
+
+
+def player_picker(store, key, groups=None, label="اللاعب"):
+    df = players_df(store)
+    if groups:
+        df = df[df["group"].isin(groups)]
+    if df.empty:
+        st.warning("لا يوجد لاعبون بعد. أضفهم من صفحة «اللاعبون» أولاً.")
+        return None
+    opts = df["code"].tolist()
+    names = dict(zip(df["code"], df["name"].astype(str)))
+    grp = dict(zip(df["code"], df["group"].astype(str)))
+    code = st.selectbox(label, opts, key=key, format_func=lambda c: f"{c} — {names.get(c, '')} ({grp.get(c, '')})")
+    row = df[df["code"] == code].iloc[0].to_dict()
+    row["height"] = float(row.get("height") or 180)
+    row["weight"] = float(row.get("weight") or 70)
+    return row
+
+
+def save_video_temp(uploaded, prefix):
+    """يحفظ الفيديو المرفوع مرة واحدة ويعيد مساره (يبقى صالحاً عبر إعادة التشغيل)."""
+    data = uploaded.getvalue()
+    key = prefix + hashlib.md5(data).hexdigest()
+    paths = st.session_state.setdefault("_videos", {})
+    if key not in paths or not os.path.exists(paths[key]):
+        suffix = os.path.splitext(uploaded.name)[1] or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            f.write(data)
+            paths[key] = f.name
+    return paths[key], key
+
+
+def extract(video_path, slowmo, label):
+    bar = st.progress(0.0, text=label)
+    landmarker = pa.create_landmarker(get_model_path())
+    try:
+        data = pa.extract_landmarks(video_path, landmarker, slowmo_factor=slowmo,
+                                    progress=lambda x: bar.progress(x, text=f"{label} {int(x * 100)}%"))
+    finally:
+        landmarker.close()
+    bar.empty()
+    return data
+
+
+def jpeg_b64(rgb):
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+def show_table(df, nd=2):
+    """يعرض الجدول مع «—» بدل القيم الفارغة."""
+    d = df.copy()
+    num = d.select_dtypes("number").columns
+    d[num] = d[num].round(nd)
+    d = d.astype(object).where(pd.notna(d), "—")
+    st.dataframe(d, hide_index=True, width="stretch")
+
+
+def fmt(v, nd=2):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    return round(float(v), nd)
+
+
+# ============================================================================
+# الشريط الجانبي
+# ============================================================================
+store = get_store()
+bank = get_bank()
+
+with st.sidebar:
+    st.markdown("## 🧠 AI Coach — الوثب العالي")
+    page = st.radio("الصفحة", [
+        "🏃 اللاعبون", "🎥 التحليل الحركي", "📏 الاختبارات والإنجاز", "📈 تحليل اللاعب",
+        "🗓️ البرنامج التدريبي", "📊 الإحصاء والتصدير", "📚 الأنموذج التعليمي", "⚙️ الإعدادات والمساعدة",
+    ], label_visibility="collapsed")
+    st.markdown("---")
+    if store.remote:
+        st.success("✅ الحفظ في Google Sheets")
+        if st.button("🔄 تحديث البيانات"):
+            store.clear_cache()
+            st.rerun()
+    else:
+        st.warning("⚠️ وضع مؤقت: البيانات تضيع عند إغلاق الصفحة. اربط Google Sheets من صفحة الإعدادات، "
+                   "أو حمّل نسخة احتياطية قبل الخروج.")
+        st.download_button("⬇️ نسخة احتياطية (Excel)", store.export_excel(), "ai_coach_backup.xlsx")
+        up = st.file_uploader("استعادة نسخة احتياطية", type=["xlsx"], key="restore")
+        if up is not None and st.session_state.get("_restored") != up.name + str(up.size):
+            store.import_excel(up.getvalue())
+            st.session_state["_restored"] = up.name + str(up.size)
+            st.rerun()
+    if st.session_state.get("bank_bytes"):
+        st.info("📚 يُستخدم ملف أنموذج مرفوع مؤقتاً.")
+
+
+# ============================================================================
+# 1) اللاعبون
+# ============================================================================
+def page_players():
+    st.title("🏃 اللاعبون")
+    with st.form("add_player", clear_on_submit=True):
+        st.subheader("إضافة لاعب")
+        c1, c2, c3 = st.columns(3)
+        code = c1.text_input("الرمز (مثل E1 أو C1)").strip().upper()
+        name = c2.text_input("الاسم")
+        group = c3.selectbox("المجموعة", GROUPS)
+        c4, c5, c6, c7 = st.columns(4)
+        gender = c4.selectbox("الجنس", ["ذكر", "أنثى"])
+        height = c5.number_input("الطول (سم)", 140, 240, 180)
+        weight = c6.number_input("الوزن (كغم)", 35, 150, 70)
+        birth = c7.number_input("سنة الميلاد", 1970, 2020, 2005)
+        c8, c9 = st.columns(2)
+        leg = c8.selectbox("رجل الارتقاء", ["اليسرى", "اليمنى"])
+        best = c9.text_input("أفضل إنجاز سابق (م)", "")
+        notes = st.text_input("ملاحظات", "")
+        if st.form_submit_button("➕ حفظ اللاعب", type="primary"):
+            existing = players_df(store)
+            if not code:
+                st.error("الرمز مطلوب.")
+            elif code in existing["code"].tolist():
+                st.error(f"الرمز {code} مستخدم. لتعديل بيانات لاعب احذفه ثم أضفه من جديد.")
+            else:
+                store.append("players", {"code": code, "name": name, "group": group, "gender": gender,
+                                         "height": height, "weight": weight, "birth_year": birth,
+                                         "takeoff_leg": leg, "best": best, "notes": notes,
+                                         "created": storage.now_str()})
+                st.success(f"تمت إضافة {code}.")
+
+    with st.expander("📥 استيراد البيانات من Excel (لاعبون + اختبارات + تحليل)"):
+        b = get_bank()
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("⬇️ قالب فارغ", model.make_template(b), "قالب_البيانات.xlsx")
+        c2.download_button("⬇️ بيانات تجريبية: مجموعتان (12 لاعباً)", model.make_template(b, sample=True),
+                           "بيانات_تجريبية_مجموعتان.xlsx")
+        c3.download_button("⬇️ بيانات تجريبية: لاعب واحد", model.make_template(b, sample="single"),
+                           "بيانات_تجريبية_لاعب_واحد.xlsx")
+        st.caption("املأ القالب في Excel ثم ارفعه هنا. للتجربة: ارفع ملف البيانات التقريبية وأنت في الوضع المؤقت "
+                   "(قبل ربط Google Sheets) حتى لا تختلط بالبيانات الحقيقية.")
+        up = st.file_uploader("ملف Excel", type=["xlsx"], key="import_xlsx")
+        if up is not None:
+            try:
+                data, report = model.parse_import(up.getvalue(), b, players_df(store)["code"].tolist())
+            except Exception as e:
+                st.error(f"تعذّرت قراءة الملف: {e}")
+                data, report = None, []
+            if data is not None:
+                st.markdown(f"سيُضاف: **{len(data['players'])}** لاعباً، **{len(data['tests'])}** نتيجة اختبار، "
+                            f"**{len(data['analyses'])}** محاولة تحليل.")
+                for r in report[:30]:
+                    st.warning(r)
+                if st.button("✅ استيراد", type="primary", key="do_import"):
+                    now = storage.now_str()
+                    try:
+                        if data["players"]:
+                            store.append("players", [dict(r, created=now) for r in data["players"]])
+                        if data["tests"]:
+                            store.append("tests", [dict(r, id=storage.new_id(), date=now) for r in data["tests"]])
+                        if data["analyses"]:
+                            store.append("analyses", [dict(r, id=storage.new_id(), date=now) for r in data["analyses"]])
+                        st.success("تم الاستيراد.")
+                    except storage.StoreError as e:
+                        st.error(str(e))
+
+    df = players_df(store)
+    st.subheader(f"قائمة اللاعبين ({len(df)})")
+    if df.empty:
+        st.info("لا يوجد لاعبون بعد.")
+        return
+    counts = df["group"].value_counts().to_dict()
+    st.caption("  |  ".join(f"{g}: {n}" for g, n in counts.items()))
+    show = df.rename(columns={"code": "الرمز", "name": "الاسم", "group": "المجموعة", "gender": "الجنس",
+                              "height": "الطول", "weight": "الوزن", "birth_year": "الميلاد",
+                              "takeoff_leg": "رجل الارتقاء", "best": "أفضل إنجاز", "notes": "ملاحظات"})
+    st.dataframe(show.drop(columns=[c for c in ["created"] if c in show]), hide_index=True, width="stretch")
+
+    with st.expander("🗑️ حذف لاعب"):
+        code = st.selectbox("اللاعب", df["code"].tolist(), key="del_player")
+        also = st.checkbox("احذف أيضاً كل تحليلاته واختباراته")
+        if st.button("حذف نهائي", type="secondary"):
+            store.delete("players", "code", code)
+            if also:
+                store.delete("analyses", "code", code)
+                store.delete("tests", "code", code)
+            st.success(f"حُذف {code}.")
+            st.rerun()
+
+
+# ============================================================================
+# 2) التحليل الحركي
+# ============================================================================
+def claude_error_text(e):
+    msg = str(e)
+    low = msg.lower()
+    if "credit balance" in low:
+        return "💳 رصيد حساب Anthropic غير كافٍ. اشحن رصيداً من console.anthropic.com ← Billing."
+    if "authentication" in low or "invalid x-api-key" in low or "401" in msg:
+        return "🔑 مفتاح Claude غير صالح. تأكد من نسخه كاملاً (يبدأ بـ sk-ant-)."
+    if "429" in msg or "rate_limit" in low:
+        return "⏳ طلبات كثيرة خلال وقت قصير. انتظر دقيقة ثم أعد المحاولة."
+    if "529" in msg or "overloaded" in low:
+        return "⏳ خوادم Claude مشغولة حالياً. أعد المحاولة بعد قليل."
+    if "not_found" in low or "404" in msg:
+        return f"⚠️ النموذج المختار غير متاح لحسابك. جرّب نموذجاً آخر. التفاصيل: {msg}"
+    return f"حدث خطأ أثناء الاتصال بـ Claude: {msg}"
+
+
+VIEWS = {"side": "🎥 جانبية", "front": "⬆️ أمامية", "back": "⬇️ خلفية", "top": "🚁 علوية (درون/سقف)"}
+POSE_VIEWS = ["side", "front", "back"]
+VIEW_HELP = {
+    "side": "من الجانب بزاوية قائمة على آخر خطوات الاقتراب: زوايا الركبة والجذع، زمن الارتقاء، زاوية الانطلاق، خفض مركز الثقل.",
+    "front": "على امتداد اتجاه الركض الأخير (خلف القائم البعيد تقريباً) مواجهاً للاعب: الميل الداخلي، ميل الجذع نحو العارضة، انحراف الركبة.",
+    "back": "خلف اللاعب على امتداد آخر خطوات الاقتراب: نفس متغيرات الأمامية (استخدم إحداهما أو كلتيهما).",
+    "top": "درون ثابت أو كاميرا سقف فوق منطقة الاقتراب والعارضة: نصف قطر المنحنى، بعد نقطة الارتقاء عن العارضة، زاوية الاقتراب، السرعة بدقة.",
+}
+
+
+def metric_source(k):
+    return "أمامية/خلفية" if k.startswith("f_") else "علوية" if k.startswith("t_") else "جانبية"
+
+
+def coach_prompt(player, an, errors_final):
+    b = get_bank()
+    ex = b["exercises"]
+    einfo = model.error_info(b, errors_final)
+    bank_text = []
+    for _, e in einfo.iterrows():
+        rows = ex[ex["رمز_الخطأ"] == e["رمز_الخطأ"]]
+        lst = "\n".join(f"   - {r['التمرين']} ({r['النوع']}): {r['النقطة_التعليمية']}" for _, r in rows.iterrows())
+        bank_text.append(f"- {e['رمز_الخطأ']} {e['الخطأ']}: {e['الوصف']} السبب المحتمل: {e['السبب_المحتمل']}\n{lst}")
+    metrics_ar = {f"{model.METRIC_LABELS[k][0]} [{metric_source(k)}]" + (f" ({model.METRIC_LABELS[k][1]})" if model.METRIC_LABELS[k][1] else ""): v
+                  for k, v in an["metrics"].items() if k in model.METRIC_LABELS}
+    views = "، ".join(VIEWS[v] for v in an["views"])
+    return f"""أنت مدرب وخبير بايوميكانيك في الوثب العالي (فوسبري فلوب). تكتب تقريراً للاعب ومدربه ضمن بحث علمي.
+
+اللاعب: {player.get('name', '')} ({player.get('code', '')}) — {player.get('gender', '')}، الطول {player['height']} سم، الوزن {player['weight']} كغم، رجل الارتقاء المكتشفة {an['take_leg']}.
+الكاميرات المستخدمة: {views}.
+
+القياسات الآلية (MediaPipe Pose لكل كاميرا، وتتبع المسار للكاميرا العلوية؛ null = لم يُحسب):
+{json.dumps(metrics_ar, ensure_ascii=False, indent=1)}
+ملاحظات التصوير: {json.dumps(an.get('notes', []), ensure_ascii=False)}
+
+الأخطاء المعتمدة في الأنموذج التعليمي لهذا اللاعب، مع التمارين التصحيحية المعتمدة لكل خطأ:
+{chr(10).join(bank_text) if bank_text else "لا توجد أخطاء مسجلة."}
+
+مرفق صور اللحظات المفتاحية من كل كاميرا مع الهيكل المرسوم، وصورة المسار من الأعلى إن وُجدت.
+
+قواعد صارمة:
+- لا تقترح أي تمرين خارج القائمة أعلاه؛ الأنموذج التعليمي محكّم ومعتمد.
+- لا تخترع قياسات. إن بدت صورة ما مخالفة للقياس فاذكر ذلك.
+- اربط بين الكاميرات: مثلاً ميل الجذع من الجانب مع الميل الداخلي من الأمام.
+
+اكتب بالعربية الفصحى وبعناوين:
+## 1. ملخص الأداء (3 جمل)
+## 2. الاقتراب (السرعة، المنحنى، خفض مركز الثقل)
+## 3. الارتقاء (المستوى الجانبي والمستوى الأمامي)
+## 4. الطيران واجتياز العارضة
+## 5. الأخطاء المعتمدة: شرح كل خطأ وأثره بلغة يفهمها اللاعب
+## 6. كيف ينفّذ اللاعب التمارين المعتمدة (النقاط التعليمية والأخطاء الشائعة أثناء التنفيذ)
+## 7. ملاحظات على جودة التصوير
+"""
+
+
+def run_views(player, specs):
+    """specs: {view: {"up": ..., "slowmo": ..., "bar": ..., "bar_len": ..., "bg": ...}}"""
+    results, notes = {}, []
+    for v in POSE_VIEWS:
+        if v not in specs:
+            continue
+        sp = specs[v]
+        path, _ = save_video_temp(sp["up"], v)
+        data = extract(path, sp["slowmo"], f"📐 {VIEWS[v]}: استخراج مفاصل الجسم...")
+        res = pa.analyze(data, height_cm=player["height"], gender=player.get("gender", "ذكر"))
+        frames = pa.key_frames(path, data["frame_idx"], res["points"], res["events"])
+        item = {"res": res, "frames": frames, "frame_idx": data["frame_idx"], "fps_eff": data["fps_eff"],
+                "video_path": path, "video_name": sp["up"].name}
+        if v in ("front", "back"):
+            item["fmetrics"] = pa.frontal_metrics(res)
+        results[v] = item
+        notes += [f"{VIEWS[v]}: {n}" for n in res.get("notes", [])]
+    if "top" in specs:
+        sp = specs["top"]
+        path, _ = save_video_temp(sp["up"], "top")
+        bar = st.progress(0.0, text="🚁 تتبع المسار من الأعلى...")
+        tr = pa.track_top(path, sp["slowmo"], progress=lambda x: bar.progress(x, text=f"🚁 تتبع المسار... {int(x * 100)}%"))
+        bar.empty()
+        dt = None
+        if "side" in results:
+            et = results["side"]["res"]["event_times"]
+            dt = max(0.1, et["peak"] - et["takeoff"])
+        tm = pa.top_metrics(tr, sp["bar"], sp["bar_len"], dt)
+        results["top"] = {"track": tr, "tm": tm, "img": pa.draw_top(sp["bg"], tr, sp["bar"], tm), "video_name": sp["up"].name}
+        notes += [f"{VIEWS['top']}: {n}" for n in tm["notes"]]
+
+    primary = next(v for v in POSE_VIEWS if v in results)
+    metrics = {}
+    if "side" in results:
+        metrics.update(results["side"]["res"]["metrics"])
+    fronts = [results[v]["fmetrics"] for v in ("front", "back") if v in results]
+    for k in (fronts[0].keys() if fronts else []):
+        vals = [f[k] for f in fronts if f.get(k) is not None]
+        metrics[k] = round(float(np.mean(vals)), 1) if vals else None
+    if "top" in results:
+        metrics.update(results["top"]["tm"]["metrics"])
+        ts = results["top"]["tm"]["metrics"].get("t_speed_mps")
+        if ts is not None:
+            if metrics.get("approach_speed_mps") is not None:
+                notes.append(f"سرعة الاقتراب من الكاميرا الجانبية {metrics['approach_speed_mps']} م/ث استُبدلت بقيمة الكاميرا العلوية الأدق.")
+            metrics["approach_speed_mps"] = ts
+    if not "side" in results:
+        notes.append("لا توجد كاميرا جانبية: متغيرات المستوى الجانبي (زوايا الركبة والجذع، زمن الارتقاء...) غير متاحة.")
+    return results, primary, metrics, notes
+
+
+def page_analysis():
+    st.title("🎥 التحليل الحركي")
+    player = player_picker(store, "an_player")
+    if player is None:
+        return
+    c1, c2, c3 = st.columns(3)
+    phase = c1.selectbox("القياس", MEASURES + ["تجربة (لا يُحفظ)"], key="an_phase")
+    attempt = c2.number_input("رقم المحاولة", 1, 20, 1, key="an_attempt")
+    week = c3.number_input("رقم أسبوع البرنامج", 1, 52, 1, key="an_week") if phase == "متابعة" else ""
+
+    views = st.multiselect("الكاميرات التي صُوّرت بها هذه المحاولة", list(VIEWS), default=["side"],
+                           format_func=VIEWS.get, key="an_views")
+    st.caption("يمكن أن تكون الكاميرات هواتف منفصلة غير متزامنة؛ التطبيق يحلل كل فيديو ويحدد لحظة الارتقاء فيه، "
+               "ثم يجمع المتغيرات في سجل واحد. صوّر نفس القفزة من كل الكاميرات.")
+    if not any(v in views for v in POSE_VIEWS):
+        st.warning("اختر كاميرا واحدة على الأقل من: جانبية أو أمامية أو خلفية (الكاميرا العلوية وحدها لا تكفي).")
+        return
+
+    specs, ready = {}, True
+    for v in views:
+        with st.expander(VIEWS[v], expanded=True):
+            st.caption(VIEW_HELP[v])
+            up = st.file_uploader("الفيديو", type=["mp4", "mov", "avi", "m4v"], key=f"up_{v}")
+            sm = st.selectbox("الحركة البطيئة", SLOWMO_OPTS, format_func=slowmo_label, key=f"sm_{v}")
+            spec = {"up": up, "slowmo": sm}
+            if up is None:
+                ready = False
+            elif v == "top":
+                path, vkey = save_video_temp(up, "top")
+                bgs = st.session_state.setdefault("_bg", {})
+                if vkey not in bgs:
+                    with st.spinner("تجهيز صورة الخلفية..."):
+                        bgs[vkey] = pa.top_background(path)
+                bg = bgs[vkey]
+                h, w = bg.shape[:2]
+                st.markdown("**حدّد طرفي العارضة على الصورة** (النسبة المئوية من عرض الصورة وارتفاعها):")
+                a1, a2, a3, a4 = st.columns(4)
+                x1 = a1.slider("القائم الأول: أفقي %", 0, 100, 35, key=f"bx1_{vkey}")
+                y1 = a2.slider("القائم الأول: عمودي %", 0, 100, 50, key=f"by1_{vkey}")
+                x2 = a3.slider("القائم الثاني: أفقي %", 0, 100, 65, key=f"bx2_{vkey}")
+                y2 = a4.slider("القائم الثاني: عمودي %", 0, 100, 50, key=f"by2_{vkey}")
+                bar = (x1 / 100 * w, y1 / 100 * h, x2 / 100 * w, y2 / 100 * h)
+                blen = st.number_input("طول العارضة بين القائمين (م)", 3.0, 4.5, 4.0, 0.01, key=f"blen_{vkey}")
+                st.image(pa.bar_preview(bg, bar), width="stretch",
+                         caption="الخط الأحمر = العارضة. النقطة الخضراء = القائم الأول (جهة بداية الاقتراب).")
+                spec.update({"bar": bar, "bar_len": blen, "bg": bg})
+            specs[v] = spec
+
+    if st.button("🚀 بدء التحليل", type="primary", width="stretch", disabled=not ready):
+        try:
+            results, primary, metrics, notes = run_views(player, specs)
+            auto = model.detect_errors(metrics, player.get("gender", "ذكر"), get_bank())
+            pr = results[primary]
+            st.session_state["an"] = {
+                "player": player, "phase": phase, "week": week, "attempt": int(attempt),
+                "views": [v for v in list(VIEWS) if v in results], "results": results, "primary": primary,
+                "metrics": metrics, "notes": notes, "auto": auto, "take_leg": pr["res"]["take_leg"],
+                "slowmo": pr["res"].get("slowmo_applied", specs[primary]["slowmo"]),
+                "saved": False, "report": None, "token": storage.new_id(),
+            }
+        except RuntimeError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"حدث خطأ غير متوقع أثناء التحليل: {e}")
+
+    an = st.session_state.get("an")
+    if not an or "results" not in an:
+        return
+    if an["player"]["code"] != player["code"]:
+        st.info("النتيجة المعروضة تخص لاعباً آخر. حلّل فيديو جديداً لهذا اللاعب.")
+        return
+    results, metrics = an["results"], an["metrics"]
+    pres = results[an["primary"]]["res"]
+
+    st.header("📐 القياسات البيوميكانيكية")
+    st.caption(f"اللاعب {player['code']} | القياس: {an['phase']} | المحاولة {an['attempt']} | الكاميرات: "
+               f"{'، '.join(VIEWS[v] for v in an['views'])} | رجل الارتقاء المكتشفة: {an['take_leg']}")
+    for n in an.get("notes", []):
+        st.info(n)
+    rows = [{"المصدر": metric_source(k), "المؤشر": model.METRIC_LABELS[k][0], "القيمة": "غير متاح" if v is None else v,
+             "الوحدة": model.METRIC_LABELS[k][1]} for k, v in metrics.items() if k in model.METRIC_LABELS]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    st.subheader("🖼️ الكاميرات")
+    st.caption("تحقق أن كل صورة تطابق اسمها قبل الحفظ؛ إن لم تطابق فالقياسات من تلك الكاميرا غير دقيقة.")
+    tabs = st.tabs([VIEWS[v] for v in an["views"]])
+    for tab, v in zip(tabs, an["views"]):
+        with tab:
+            if v == "top":
+                tm = results["top"]["tm"]
+                st.image(results["top"]["img"], width="stretch",
+                         caption="الأزرق: مسار اللاعب | الأحمر: العارضة | الأخضر: دائرة المنحنى | الأصفر: نقطة الارتقاء")
+                continue
+            r = results[v]
+            fr, res = r["frames"], r["res"]
+            names = [n for n in EVENT_NAMES if n in fr]
+            for c, n in zip(st.columns(len(names)) if names else [], names):
+                c.image(fr[n], caption=f"{EVENT_NAMES[n]} ({res['event_times'][n]} ث)", width="stretch")
+            s, et = res["series"], res["event_times"]
+            cd = {"الزمن (ث)": s["t"], "زاوية ركبة الارتقاء (°)": s["knee_take"], "ميل الجذع عن العمودي (°)": s["trunk"]}
+            ch = pd.DataFrame(cd)
+            ch = ch[(ch["الزمن (ث)"] >= et["plant"] - 1.5) & (ch["الزمن (ث)"] <= et["clearance"] + 0.5)].set_index("الزمن (ث)")
+            g1, g2 = st.columns(2)
+            g1.markdown(f"**زاوية ركبة الارتقاء** (الارتكاز {et['plant']}–{et['takeoff']} ث)")
+            g1.line_chart(ch[["زاوية ركبة الارتقاء (°)"]])
+            g2.markdown("**ميل الجذع عن العمودي**")
+            g2.line_chart(ch[["ميل الجذع عن العمودي (°)"]])
+
+    st.subheader("⚠️ الأخطاء الفنية (وفق الأنموذج التعليمي)")
+    b = get_bank()
+    all_err = b["errors"]
+    labels = dict(zip(all_err["رمز_الخطأ"], all_err["الخطأ"]))
+    auto_ids = [e["id"] for e in an["auto"]]
+    if an["auto"]:
+        for e in an["auto"]:
+            st.markdown(f"- **{e['name']}** ({e['id']}): القيمة {fmt(e['value'])} {e['op']} الحد {fmt(e['threshold'])}")
+    else:
+        st.success("لم يُكتشف خطأ آلي وفق حدود الأنموذج.")
+    visual = all_err[all_err["طريقة_الكشف"] == "بصري"]
+    final = st.multiselect(
+        "الأخطاء المعتمدة لهذه المحاولة (عدّل بخبرتك: احذف الخطأ غير الصحيح وأضف الأخطاء البصرية)",
+        list(labels), default=[i for i in auto_ids if i in labels], format_func=lambda c: f"{c} — {labels[c]}",
+        key=f"an_final_{an.get('token', '')}")
+    st.caption("الأخطاء البصرية المتاحة: " + "، ".join(f"{r['رمز_الخطأ']} {r['الخطأ']}" for _, r in visual.iterrows()))
+
+    c1, c2 = st.columns([1, 2])
+    if an["phase"] in MEASURES:
+        if c1.button("💾 حفظ هذه المحاولة", type="primary", disabled=an["saved"]):
+            row = {"id": storage.new_id(), "date": storage.now_str(), "code": player["code"],
+                   "group": player.get("group", ""), "phase": an["phase"], "week": an.get("week", ""),
+                   "attempt": an["attempt"], **metrics,
+                   "errors_auto": ",".join(auto_ids), "errors_final": ",".join(final),
+                   "views": ",".join(an["views"]), "slowmo": an["slowmo"],
+                   "zoom_ratio": pres["camera"]["zoom_ratio"], "detection_rate": pres["detection_rate"],
+                   "video": " | ".join(results[v].get("video_name", "") for v in an["views"]),
+                   "events": json.dumps(pres["event_times"], ensure_ascii=False)}
+            try:
+                store.append("analyses", row)
+                an["saved"] = True
+                st.success("تم الحفظ.")
+            except storage.StoreError as e:
+                st.error(str(e))
+        if an["saved"]:
+            c2.success("✅ محفوظة")
+    else:
+        c1.info("وضع التجربة: لا يُحفظ.")
+
+    st.subheader("⬇️ تنزيلات")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("القياسات (CSV)", pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"),
+                       f"{player['code']}_metrics.csv", "text/csv")
+    for v in [v for v in POSE_VIEWS if v in results]:
+        r = results[v]
+        angles = pa.frame_angles(r["res"]["points"], r["res"]["series"]["t"], r["frame_idx"])
+        d2.download_button(f"زوايا كل إطار: {VIEWS[v]}", angles.to_csv(index=False).encode("utf-8-sig"),
+                           f"{player['code']}_{v}_angles.csv", "text/csv", key=f"ang_{v}")
+    pv = an["primary"]
+    if d3.button(f"🎬 فيديو مُحلَّل ({VIEWS[pv]})"):
+        r = results[pv]
+        out = os.path.join(tempfile.gettempdir(), f"{player['code']}_{pv}_annotated.mp4")
+        with st.spinner("جارٍ رسم الهيكل على الفيديو..."):
+            ok = pa.annotated_video(r["video_path"], out, r["frame_idx"], r["res"]["points"], r["fps_eff"],
+                                    events={EVENT_NAMES[k]: i for k, i in r["res"]["events"].items()})
+        if ok:
+            an["annotated"] = out
+    if an.get("annotated") and os.path.exists(an["annotated"]):
+        with open(an["annotated"], "rb") as f:
+            d3.download_button("تحميل الفيديو المُحلَّل", f.read(), os.path.basename(an["annotated"]), "video/mp4")
+        d3.caption("يُفتح ببرنامج VLC أو مشغّل Windows.")
+
+    st.markdown("---")
+    st.subheader("🏅 تقرير المدرب الذكي (Claude)")
+    key = secret("ANTHROPIC_API_KEY")
+    if not key:
+        key = st.text_input("مفتاح Claude API", type="password", key="claude_key")
+    model_label = st.selectbox("النموذج", list(CLAUDE_MODELS), key="claude_model")
+    st.caption("يشرح Claude الأداء والأخطاء المعتمدة وطريقة تنفيذ التمارين المعتمدة فقط، دون إضافة تمارين من عنده.")
+    if st.button("✍️ اكتب التقرير", disabled=not key):
+        import anthropic
+
+        content = []
+        for v in an["views"]:
+            if v == "top":
+                content.append({"type": "text", "text": "صورة المسار من الأعلى (الأزرق المسار، الأحمر العارضة، الأصفر نقطة الارتقاء)"})
+                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                            "data": jpeg_b64(results["top"]["img"])}})
+                continue
+            want = list(EVENT_NAMES) if v == "side" else ["plant", "takeoff"]
+            for n in want:
+                if n in results[v]["frames"]:
+                    content.append({"type": "text", "text": f"{VIEWS[v]} — {EVENT_NAMES[n]}"})
+                    content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                                "data": jpeg_b64(results[v]["frames"][n])}})
+        content.append({"type": "text", "text": coach_prompt(player, an, final)})
+        try:
+            client = anthropic.Anthropic(api_key=key.strip())
+            with client.messages.stream(model=CLAUDE_MODELS[model_label], max_tokens=8000,
+                                        messages=[{"role": "user", "content": content}]) as stream:
+                an["report"] = st.write_stream(stream.text_stream)
+        except Exception as e:
+            st.error(claude_error_text(e))
+    elif an.get("report"):
+        st.markdown(an["report"])
+    if an.get("report"):
+        st.download_button("⬇️ تحميل التقرير", str(an["report"]).encode("utf-8"),
+                           f"{player['code']}_report.md", "text/markdown")
+
+
+# ============================================================================
+# 3) الاختبارات والإنجاز
+# ============================================================================
+def page_tests():
+    st.title("📏 الاختبارات البدنية والإنجاز")
+    player = player_picker(store, "t_player")
+    if player is None:
+        return
+    b = get_bank()
+    tmeta = b["tests"]
+    c1, c2 = st.columns(2)
+    phase = c1.selectbox("القياس", MEASURES, key="t_phase")
+    tdate = c2.date_input("تاريخ الاختبار", date.today(), key="t_date")
+    week = st.number_input("رقم أسبوع البرنامج", 1, 52, 1, key="t_week") if phase == "متابعة" else ""
+
+    tab1, tab2, tab3 = st.tabs(["✍️ إدخال النتائج", "🎥 الوثب العمودي بالفيديو", "📋 النتائج المسجلة"])
+    with tab1:
+        st.caption("كل حفظ يُسجَّل محاولةً مستقلة. عند دراسة لاعب واحد سجّل 2–3 محاولات لكل اختبار في كل قياس.")
+        manual = tmeta[~tmeta["طريقة_القياس"].astype(str).str.contains("آلي")]
+        grid = pd.DataFrame({"الرمز": manual["رمز_الاختبار"], "الاختبار": manual["الاختبار"],
+                             "الوحدة": manual["الوحدة"], "النتيجة": [None] * len(manual)})
+        edited = st.data_editor(grid, hide_index=True, width="stretch", key=f"grid_{player['code']}_{phase}_{week}_{st.session_state.get('grid_n', 0)}",
+                                disabled=["الرمز", "الاختبار", "الوحدة"],
+                                column_config={"النتيجة": st.column_config.NumberColumn("النتيجة", format="%.2f")})
+        if st.button("💾 حفظ النتائج", type="primary"):
+            rows = [{"id": storage.new_id(), "date": str(tdate), "code": player["code"],
+                     "group": player.get("group", ""), "phase": phase, "week": week, "test_id": r["الرمز"],
+                     "value": float(r["النتيجة"]), "method": "يدوي"}
+                    for _, r in edited.iterrows() if pd.notna(r["النتيجة"])]
+            if rows:
+                store.append("tests", rows)
+                st.session_state["grid_n"] = st.session_state.get("grid_n", 0) + 1  # تفريغ الجدول للمحاولة التالية
+                st.success(f"حُفظت {len(rows)} نتيجة. لتسجيل محاولة أخرى أدخلها في الجدول وأعد الحفظ.")
+            else:
+                st.warning("لم تُدخل أي نتيجة.")
+
+    with tab2:
+        st.markdown("صوّر اللاعب **من الجانب بكاميرا ثابتة على حامل**، وتظهر القدمان كاملتين. "
+                    "الأفضل 120 إطاراً/ث أو أكثر. الحساب: الارتفاع = g × (زمن الطيران)² ÷ 8.")
+        st.caption("تنبيه منهجي: طريقة زمن الطيران تفترض الهبوط بنفس وضع الارتقاء (الرجلان ممدودتان)؛ "
+                   "ثني الركبتين عند الهبوط يزيد النتيجة.")
+        slowmo = st.selectbox("الحركة البطيئة", SLOWMO_OPTS, format_func=slowmo_label, key="vj_slowmo")
+        up = st.file_uploader("فيديو الوثب العمودي", type=["mp4", "mov", "avi", "m4v"], key="vj_video")
+        if st.button("📐 قياس الوثب", disabled=up is None):
+            path, _ = save_video_temp(up, "vj")
+            try:
+                data = extract(path, slowmo, "📐 تتبع القدمين...")
+                r = pa.measure_vertical_jump(data, player["height"])
+                ev = {"takeoff": r["takeoff_idx"], "clearance": r["landing_idx"]}
+                fr = pa.key_frames(path, data["frame_idx"], pa.clean_points(data["points"], data["real_fps"]), ev)
+                st.session_state["vj"] = {"code": player["code"], "r": r, "frames": fr}
+            except RuntimeError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"خطأ غير متوقع: {e}")
+        vj = st.session_state.get("vj")
+        if vj and vj["code"] == player["code"]:
+            r = vj["r"]
+            m1, m2 = st.columns(2)
+            m1.metric("ارتفاع الوثب", f"{r['height_cm']} سم")
+            m2.metric("زمن الطيران", f"{r['flight_s']} ث")
+            for n in r["notes"]:
+                st.warning(n)
+            cc = st.columns(2)
+            for c, (k, lbl) in zip(cc, [("takeoff", "لحظة ترك الأرض"), ("clearance", "لحظة الهبوط")]):
+                if k in vj["frames"]:
+                    c.image(vj["frames"][k], caption=lbl, width="stretch")
+            st.caption("تحقق من الصورتين: الأولى يجب أن تكون آخر لحظة تلمس فيها القدم الأرض، والثانية أول لمسة.")
+            if st.button("💾 حفظ النتيجة كاختبار T02"):
+                store.append("tests", {"id": storage.new_id(), "date": str(tdate), "code": player["code"],
+                                       "group": player.get("group", ""), "phase": phase, "week": week, "test_id": "T02",
+                                       "value": r["height_cm"], "method": "آلي (فيديو)"})
+                st.success("تم الحفظ.")
+
+    with tab3:
+        t = safe_read(store, "tests")
+        if t.empty or "code" not in t:
+            st.info("لا توجد نتائج بعد.")
+        else:
+            t = t[t["code"].astype(str) == player["code"]].copy()
+            names = dict(zip(tmeta["رمز_الاختبار"], tmeta["الاختبار"]))
+            t["الاختبار"] = t["test_id"].map(names).fillna(t["test_id"])
+            t = t.reindex(columns=["date", "phase", "الاختبار", "value", "method", "id"])
+            st.dataframe(t.rename(
+                columns={"date": "التاريخ", "phase": "القياس", "value": "النتيجة", "method": "الطريقة"}),
+                hide_index=True, width="stretch")
+            if not t.empty:
+                del_id = st.selectbox("حذف نتيجة (بالمعرّف id)", t["id"].astype(str).tolist(), key="del_test")
+                if st.button("حذف النتيجة"):
+                    store.delete("tests", "id", del_id)
+                    st.rerun()
+
+
+# ============================================================================
+# 4) المقارنة القبلية/البعدية للاعب
+# ============================================================================
+def page_compare():
+    st.title("📈 تحليل اللاعب (قبلي • متابعة • بعدي)")
+    st.caption("يعمل مع لاعب واحد: يقارن كل محاولات القبلي بكل محاولات البعدي، ويتابع التطور أسبوعياً. "
+               "كلما زادت المحاولات في كل قياس (3–5) كان الحكم أدق.")
+    player = player_picker(store, "c_player")
+    if player is None:
+        return
+    b = get_bank()
+    an_all = safe_read(store, "analyses")
+    trials = model.trials_data(an_all, safe_read(store, "tests"), b, player["code"])
+    if trials.empty:
+        st.info("لا توجد بيانات لهذا اللاعب بعد.")
+        return
+
+    mine = an_all[an_all["code"].astype(str) == player["code"]] if not an_all.empty and "code" in an_all else pd.DataFrame()
+    counts = mine.groupby("phase").size() if not mine.empty else {}
+    m = st.columns(3)
+    for c, p in zip(m, MEASURES):
+        c.metric(f"محاولات تحليل الفيديو: {p}", int(counts.get(p, 0)) if len(counts) else 0)
+
+    table = model.single_subject_table(trials, b)
+    st.subheader("المقارنة القبلية/البعدية على مستوى المحاولات")
+    show_table(table)
+    with st.expander("ℹ️ كيف أقرأ الجدول؟"):
+        st.markdown("""
+- **حجم الأثر d**: 0.2 صغير، 0.5 متوسط، 0.8 كبير (بين محاولات القبلي والبعدي).
+- **p (t)** اختبار t لـ Welch بين المحاولات، و**p (مان-ويتني)** بديله اللامعلمي (يحتاج 3 محاولات أو أكثر في كل قياس).
+- **PND %** نسبة محاولات البعدي الأفضل من **أفضل** محاولة قبلية؛ 90% فأكثر = أثر قوي، 70–90% = أثر متوسط.
+- **الحكم** يقارن الفرق بـ **أصغر تغير مهم** (0.2 × انحراف محاولات القبلي): الفرق الأصغر منه يُعدّ تذبذباً طبيعياً.
+- اتجاه «الأفضل» مأخوذ من الأنموذج التعليمي (مثلاً: الزمن الأقل أفضل، وزاوية الركبة الأعلى أفضل).
+- ملاحظة منهجية: محاولات اللاعب الواحد ليست مستقلة تماماً، لذا تُفسَّر قيم p بحذر مع الاعتماد على حجم الأثر وPND والرسم.
+""")
+
+    st.subheader("منحنى التطور")
+    vars_ = trials[["var", "label"]].drop_duplicates()
+    default = "A01" if "A01" in set(vars_["var"]) else vars_["var"].iloc[0]
+    var = st.selectbox("المتغير", vars_["var"].tolist(), index=vars_["var"].tolist().index(default),
+                       format_func=lambda v: vars_.set_index("var")["label"][v], key="c_var")
+    d = trials[trials["var"] == var]
+    means = d.groupby("order")["value"].mean().rename("المتوسط").to_frame()
+    means.index.name = "الأسبوع (0 = قبلي)"
+    g1, g2 = st.columns(2)
+    g1.markdown("**كل المحاولات**")
+    g1.scatter_chart(d.rename(columns={"order": "الأسبوع (0 = قبلي)", "value": "القيمة"}),
+                     x="الأسبوع (0 = قبلي)", y="القيمة")
+    g2.markdown("**متوسط كل قياس**")
+    g2.line_chart(means)
+    st.caption(f"آخر نقطة (الأسبوع {int(b['settings']['weeks']) + 1}) = القياس البعدي.")
+
+    errs_by = {}
+    if not an_all.empty and "errors_final" in an_all:
+        a = an_all[an_all["code"].astype(str) == player["code"]].copy()
+        labels = dict(zip(b["errors"]["رمز_الخطأ"], b["errors"]["الخطأ"]))
+        st.subheader("الأخطاء الفنية عبر القياسات")
+        a["week"] = a["week"] if "week" in a else ""
+        for (p, w), grp in a.groupby(["phase", "week"], sort=False):
+            n = len(grp)
+            cnt = {}
+            for v in grp["errors_final"].fillna("").astype(str):
+                for x in [x for x in v.split(",") if x]:
+                    cnt[x] = cnt.get(x, 0) + 1
+            name = p + (f" (أسبوع {int(float(w))})" if str(w) not in ("", "nan") else "")
+            errs_by[name] = {labels.get(k, k): f"{v}/{n}" for k, v in sorted(cnt.items())}
+            st.markdown(f"**{name}** — {n} محاولة: " +
+                        ("، ".join(f"{labels.get(k, k)} ({v}/{n})" for k, v in sorted(cnt.items())) or "لا توجد أخطاء"))
+
+    st.subheader("⬇️ تنزيلات")
+    c1, c2 = st.columns(2)
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        trials.to_excel(w, sheet_name="المحاولات", index=False)
+        table.to_excel(w, sheet_name="المقارنة", index=False)
+    c1.download_button("بيانات المحاولات والمقارنة (Excel)", buf.getvalue(), f"{player['code']}_trials.xlsx")
+    researcher = st.text_input("اسم الباحث (للتقرير)", "", key="c_researcher")
+    c2.download_button("📄 تقرير اللاعب (Word)", model.player_report_docx(player, table, trials, errs_by, researcher),
+                       f"تقرير_{player['code']}.docx",
+                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
+
+
+# ============================================================================
+# 5) البرنامج التدريبي
+# ============================================================================
+def page_program():
+    st.title("🗓️ البرنامج التدريبي المخصص")
+    st.caption("يُبنى البرنامج من بنك التمارين المعتمد في الأنموذج التعليمي، ويُخصَّص حسب أخطاء اللاعب وطوله ووزنه.")
+    player = player_picker(store, "p_player")
+    if player is None:
+        return
+    if player.get("group") == "ضابطة":
+        st.warning("هذا اللاعب في المجموعة الضابطة؛ عادةً لا يطبّق البرنامج التجريبي.")
+    b = get_bank()
+    labels = dict(zip(b["errors"]["رمز_الخطأ"], b["errors"]["الخطأ"]))
+
+    a = safe_read(store, "analyses")
+    default = []
+    if not a.empty and "errors_final" in a:
+        pre = a[(a["code"].astype(str) == player["code"]) & (a["phase"] == "قبلي")]
+        for v in pre["errors_final"].fillna("").astype(str):
+            default += [x for x in v.split(",") if x and x in labels and x not in default]
+    if not default:
+        st.info("لا توجد أخطاء محفوظة من الاختبار القبلي لهذا اللاعب؛ اختر الأخطاء يدوياً.")
+    errs = st.multiselect("الأخطاء المستهدفة (مرتبة آلياً حسب الأولوية)", list(labels), default=default,
+                          format_func=lambda c: f"{c} — {labels[c]}")
+    s = b["settings"]
+    pers = model.personalization(player["height"], player["weight"], s)
+    m = st.columns(4)
+    m[0].metric("مؤشر كتلة الجسم", pers["bmi"])
+    m[1].metric("معامل حجم القفزات والقوة", pers["factor"])
+    m[2].metric("ارتفاع الحواجز", f"{pers['hurdle_cm']} سم")
+    m[3].metric("ارتفاع الصندوق", f"{pers['box_cm']} سم")
+    st.caption(f"البرنامج: {int(s['weeks'])} أسابيع × {int(s['units_per_week'])} وحدات، "
+               f"ويعالج أهم {int(s['max_errors'])} أخطاء (يُغيّر من ورقة الإعدادات في ملف الأنموذج).")
+
+    prog = model.build_program(player, errs, b)
+    tbl = model.program_table(prog)
+    for w in prog["weeks"]:
+        with st.expander(f"الأسبوع {w['week']} — {w['phase']}", expanded=w["week"] == 1):
+            wt = tbl[tbl["الأسبوع"] == w["week"]]
+            for u in sorted(wt["الوحدة"].unique()):
+                st.markdown(f"**الوحدة {u}**")
+                st.dataframe(wt[wt["الوحدة"] == u][["القسم", "التمرين", "الجرعة", "الراحة", "النقطة التعليمية"]],
+                             hide_index=True, width="stretch")
+    researcher = st.text_input("اسم الباحث/المدرب (يظهر في الملف)", "", key="researcher")
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ تحميل البرنامج (Word)", model.program_to_docx(prog, researcher),
+                       f"program_{player['code']}.docx",
+                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
+    if c2.button("💾 تسجيل البرنامج في قاعدة البيانات"):
+        store.append("programs", {"id": storage.new_id(), "date": storage.now_str(), "code": player["code"],
+                                  "errors": ",".join(t["رمز_الخطأ"] for t in prog["targets"]),
+                                  "weeks": int(s["weeks"]), "units_per_week": int(s["units_per_week"]),
+                                  "bmi": pers["bmi"], "factor": pers["factor"]})
+        st.success("سُجّل البرنامج.")
+
+
+# ============================================================================
+# 6) الإحصاء والتصدير
+# ============================================================================
+def page_stats():
+    st.title("📊 الإحصاء والتصدير")
+    st.caption("مراجعة سريعة داخل التطبيق. للتحليل النهائي في الرسالة استخدم SPSS بعد التحقق من التوزيع الطبيعي.")
+    how = st.radio("عند تعدد المحاولات", ["mean", "max", "last"], horizontal=True,
+                   format_func=lambda x: {"mean": "المتوسط", "max": "الأعلى", "last": "آخر محاولة"}[x], key="s_how")
+    L = model.long_data(players_df(store), safe_read(store, "analyses"), safe_read(store, "tests"), get_bank(), how)
+    if L.empty:
+        st.info("لا توجد بيانات بعد.")
+        return
+    wide = model.spss_wide(L)
+    c1, c2 = st.columns(2)
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        wide.to_excel(w, sheet_name="SPSS", index=False)
+        L.to_excel(w, sheet_name="long", index=False)
+        key = L[["var", "label", "unit", "kind"]].drop_duplicates()
+        key.to_excel(w, sheet_name="دليل المتغيرات", index=False)
+    c1.download_button("⬇️ ملف SPSS (Excel)", buf.getvalue(), "spss_data.xlsx", type="primary")
+    c2.caption("ورقة SPSS: صف لكل لاعب، وعمودان لكل متغير (pre و post). ورقة «دليل المتغيرات» تشرح الرموز.")
+
+    kinds = ["بايوميكانيكي", "قابلية بدنية", "الإنجاز"]
+    kind = st.radio("النوع", [k for k in kinds if k in set(L["kind"])], horizontal=True)
+    vars_ = L[L["kind"] == kind][["var", "label"]].drop_duplicates()
+    var = st.selectbox("المتغير", vars_["var"].tolist(), format_func=lambda v: vars_.set_index("var")["label"][v])
+    table, between = model.group_stats(L, var)
+    if table.empty:
+        st.info("لا توجد بيانات كافية.")
+        return
+    st.subheader("داخل كل مجموعة (قبلي ← بعدي)")
+    show_table(table, 3)
+    if (table["ن"] < 2).any():
+        st.info("تظهر «—» في الانحراف واختبار t عندما يكون في المجموعة أقل من لاعبَين لهما قياس قبلي وبعدي. "
+                "إذا كانت عينتك لاعباً واحداً فاستخدم صفحة «📈 تحليل اللاعب»؛ فهي تحلل على مستوى المحاولات.")
+    st.caption("اختبار t للعينات المترابطة. حجم الأثر dz: 0.2 صغير، 0.5 متوسط، 0.8 كبير. "
+               "نسبة التحسن موجبة = تحسن (مع مراعاة أن الزمن الأقل أفضل).")
+    if between:
+        st.subheader("بين المجموعتين")
+        rows = []
+        for ph, v in between.items():
+            rows.append({"القياس": ph, "المقارنة": f"{v['groups'][0]} مقابل {v['groups'][1]}",
+                         "قيمة t (Welch)": round(v["t"], 3), "الدلالة p": round(v["p"], 4), "حجم الأثر d": round(v["d"], 3),
+                         "التفسير": ("تكافؤ المجموعتين" if v["p"] >= 0.05 else "فرق دال") if ph == "قبلي"
+                         else ("فرق دال" if v["p"] < 0.05 else "فرق غير دال")})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption("القياس القبلي يُستخدم للتحقق من تكافؤ المجموعتين قبل التجربة.")
+    means = L[L["var"] == var].groupby(["group", "phase"])["value"].mean().unstack("phase")
+    means = means[[p for p in PHASES if p in means]]
+    st.bar_chart(means)
+
+
+# ============================================================================
+# 7) الأنموذج التعليمي
+# ============================================================================
+def page_bank():
+    st.title("📚 الأنموذج التعليمي")
+    st.markdown("هذا البنك **مسودة** للعرض على الخبراء. عدّله في Excel ثم ارفعه هنا للتجربة، "
+                "أو استبدل ملف `model_bank.xlsx` في GitHub ليصبح دائماً.")
+    b = get_bank()
+    default_bytes = b""
+    if os.path.exists(BANK_PATH):
+        with open(BANK_PATH, "rb") as f:
+            default_bytes = f.read()
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ تحميل ملف الأنموذج الحالي", st.session_state.get("bank_bytes") or default_bytes,
+                       "model_bank.xlsx")
+    up = c2.file_uploader("رفع ملف أنموذج معدّل (للجلسة الحالية)", type=["xlsx"])
+    if up is not None:
+        try:
+            model.load_bank(up.getvalue())
+            st.session_state["bank_bytes"] = up.getvalue()
+            st.success("تم تحميل الأنموذج المعدّل لهذه الجلسة.")
+        except Exception as e:
+            st.error(f"الملف غير صالح: {e}")
+    if st.session_state.get("bank_bytes") and st.button("العودة إلى الأنموذج الأصلي"):
+        st.session_state.pop("bank_bytes")
+        st.rerun()
+    t1, t2, t3, t4 = st.tabs(["الأخطاء", "التمارين", "الاختبارات", "الإعدادات"])
+    t1.dataframe(b["errors"], hide_index=True, width="stretch")
+    t2.dataframe(b["exercises"], hide_index=True, width="stretch")
+    t3.dataframe(b["tests"], hide_index=True, width="stretch")
+    t4.json(b["settings"])
+
+
+# ============================================================================
+# 8) الإعدادات والمساعدة
+# ============================================================================
+def page_settings():
+    st.title("⚙️ الإعدادات والمساعدة")
+    st.subheader("ربط Google Sheets")
+    if store.remote:
+        if st.button("اختبار الاتصال"):
+            try:
+                store.ping()
+                st.success("الاتصال يعمل ✅")
+            except storage.StoreError as e:
+                st.error(str(e))
+    else:
+        st.markdown("""
+1. أنشئ ملف **Google Sheets** جديداً (فارغاً).
+2. من القائمة: **Extensions ← Apps Script** (الإضافات ← برمجة التطبيقات).
+3. احذف الكود الموجود والصق محتوى ملف `apps_script.gs`، وغيّر كلمة السر في السطر `const TOKEN`.
+4. اضغط **Deploy ← New deployment**، واختر النوع **Web app**:
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+5. وافق على الصلاحيات، ثم انسخ **Web app URL** (ينتهي بـ `/exec`).
+6. في Streamlit: **Manage app ← ⋮ ← Settings ← Secrets** وأضف:
+```
+SHEETS_URL = "https://script.google.com/macros/s/.../exec"
+SHEETS_TOKEN = "كلمة السر نفسها"
+```
+7. احفظ، ثم أعد تشغيل التطبيق (Reboot).
+""")
+    st.subheader("مفتاح Claude")
+    st.markdown("أضف في Secrets السطر: `ANTHROPIC_API_KEY = \"sk-ant-...\"` (من console.anthropic.com).")
+    st.subheader("نصائح التصوير")
+    st.markdown("""
+- هاتف **ثابت على حامل**، **بدون تقريب (Zoom)**، من الجانب على بعد 10–15 م.
+- يظهر في الإطار آخر 3 خطوات والعارضة والمرتبة.
+- التصوير بـ 120 أو 240 إطاراً/ث، وحدد عامل الحركة البطيئة في صفحة التحليل.
+- إضاءة جيدة وملابس بلون مختلف عن الخلفية.
+
+**التصوير بعدة كاميرات (هواتف منفصلة تكفي):**
+- 🎥 **الجانبية:** عمودية على آخر 3 خطوات، على بعد 10–15 م.
+- ⬆️ **الأمامية:** على امتداد اتجاه الركض في الخطوات الأخيرة (خلف القائم البعيد تقريباً) مواجهة للاعب.
+- ⬇️ **الخلفية:** خلف اللاعب على امتداد آخر خطوات الاقتراب. تكفي الأمامية أو الخلفية، واستخدام الاثنتين يرفع الدقة.
+- 🚁 **العلوية:** درون **ثابت** (Hover) أو كاميرا سقف، عمودياً قدر الإمكان، ويظهر فيها المنحنى كاملاً والعارضة.
+  حدّد طرفي العارضة على الصورة في صفحة التحليل؛ طولها المعروف (4 م) هو مقياس المسافات.
+- صوّر **نفس القفزة** بكل الكاميرات. لا حاجة لتشغيلها في نفس اللحظة؛ التطبيق يحدد لحظة الارتقاء في كل فيديو.
+""")
+
+
+PAGES = {
+    "🏃 اللاعبون": page_players, "🎥 التحليل الحركي": page_analysis, "📏 الاختبارات والإنجاز": page_tests,
+    "📈 تحليل اللاعب": page_compare, "🗓️ البرنامج التدريبي": page_program,
+    "📊 الإحصاء والتصدير": page_stats, "📚 الأنموذج التعليمي": page_bank, "⚙️ الإعدادات والمساعدة": page_settings,
+}
+try:
+    PAGES[page]()
+except storage.StoreError as e:
+    st.error(f"مشكلة في حفظ/قراءة البيانات: {e}")
